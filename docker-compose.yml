@@ -1,0 +1,15 @@
+services:
+  # The half service batch-converts decimal strings to exact binary16
+  # bit patterns. By default it converts /data/batch.json; supply your
+  # own file or stream JSON on stdin with:
+  #
+  #   docker compose run --rm half /data/my-batch.json
+  #   docker compose run --rm -T half - < batch.json
+  half:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: halfconv:latest
+    command: ["/data/batch.json"]
+    volumes:
+      - ./data:/data:ro
