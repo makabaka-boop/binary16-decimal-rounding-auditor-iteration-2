@@ -43,6 +43,26 @@ func (b Bits) Pattern() uint16 {
 // IsInf reports whether the result is an infinity.
 func (b Bits) IsInf() bool { return b.Class == ClassInfinity }
 
+// DecodePattern reconstructs Bits from a binary16 pattern. It accepts every
+// finite pattern and the two infinities, but rejects NaN encodings
+// (exponent field 31 with a nonzero fraction).
+func DecodePattern(p uint16) (Bits, bool) {
+	sign := (p >> 15) & 1
+	E := (p >> 10) & 0x1f
+	F := p & 0x3ff
+	if E == 31 {
+		if F != 0 {
+			return Bits{}, false
+		}
+		return Bits{Sign: sign, E: 31, F: 0, Value: nil, Class: ClassInfinity}, true
+	}
+	value := finiteMagnitude(E, F)
+	if sign == 1 {
+		value.Neg(value)
+	}
+	return Bits{Sign: sign, E: E, F: F, Value: value, Class: classOf(E, F)}, true
+}
+
 // powersOfTwo caches 2^e for the small range visited during binade
 // searches (-25..16).
 var powersOfTwo = map[int]*big.Rat{}
@@ -341,4 +361,189 @@ func (iv Interval) Contains(negativeInput bool, x *big.Rat) bool {
 		}
 	}
 	return true
+}
+
+func cloneRat(r *big.Rat) *big.Rat {
+	if r == nil {
+		return nil
+	}
+	return new(big.Rat).Set(r)
+}
+
+func cloneInterval(iv Interval) Interval {
+	return Interval{
+		Low:           cloneRat(iv.Low),
+		High:          cloneRat(iv.High),
+		LowInclusive:  iv.LowInclusive,
+		HighInclusive: iv.HighInclusive,
+		LowInfinite:   iv.LowInfinite,
+		HighInfinite:  iv.HighInfinite,
+	}
+}
+
+// AdditiveBiasInterval shifts target's preimage certificate from values y
+// to additive biases b satisfying y = original + b. The returned interval
+// encodes the exact IEEE addition result convention:
+//
+//   - any nonzero sum y is accepted according to the normal preimage
+//     certificate;
+//   - an exact rational cancellation normally encodes positive zero, so a
+//     target of +0 includes the bias -original, even when that bias lies
+//     at the open numerical endpoint of the shifted certificate;
+//   - target -0 includes that cancellation only when original itself is a
+//     literal negative zero (originalNegative == true) and the bias is
+//     exactly zero; therefore the two signed-zero certificates never
+//     overlap.
+func AdditiveBiasInterval(target Bits, originalNegative bool, original *big.Rat) Interval {
+	iv := cloneInterval(IntervalOf(target))
+	if !iv.LowInfinite && iv.Low != nil {
+		iv.Low.Sub(iv.Low, original)
+	}
+	if !iv.HighInfinite && iv.High != nil {
+		iv.High.Sub(iv.High, original)
+	}
+
+	if target.Class != ClassZero {
+		return iv
+	}
+
+	// The certificate endpoint at y=0 moves with the original: it is
+	// reached by bias b = -original. Numerical exact cancellation is
+	// normally +0; only literal -0 plus exact zero bias keeps -0.
+	cancelBias := new(big.Rat).Neg(original)
+	includeCancellation := true
+	if target.Sign == 1 {
+		includeCancellation = original.Sign() == 0 && originalNegative
+	} else if original.Sign() == 0 && originalNegative {
+		includeCancellation = false
+	}
+	if iv.Low != nil && iv.Low.Cmp(cancelBias) == 0 {
+		iv.LowInclusive = includeCancellation
+	}
+	if iv.High != nil && iv.High.Cmp(cancelBias) == 0 {
+		iv.HighInclusive = includeCancellation
+	}
+	return iv
+}
+
+// Intersect returns the exact intersection of two extended intervals. The
+// boolean is false if the intersection is empty. When equal finite bounds
+// meet, the resulting endpoint is included only when both include it.
+func Intersect(a, b Interval) (Interval, bool) {
+	out := Interval{}
+	switch {
+	case a.LowInfinite:
+		out.Low, out.LowInclusive = cloneRat(b.Low), b.LowInclusive
+		out.LowInfinite = b.LowInfinite
+	case b.LowInfinite:
+		out.Low, out.LowInclusive = cloneRat(a.Low), a.LowInclusive
+		out.LowInfinite = a.LowInfinite
+	default:
+		switch c := a.Low.Cmp(b.Low); {
+		case c > 0:
+			out.Low, out.LowInclusive = cloneRat(a.Low), a.LowInclusive
+		case c < 0:
+			out.Low, out.LowInclusive = cloneRat(b.Low), b.LowInclusive
+		default:
+			out.Low = cloneRat(a.Low)
+			out.LowInclusive = a.LowInclusive && b.LowInclusive
+		}
+	}
+
+	switch {
+	case a.HighInfinite:
+		out.High, out.HighInclusive = cloneRat(b.High), b.HighInclusive
+		out.HighInfinite = b.HighInfinite
+	case b.HighInfinite:
+		out.High, out.HighInclusive = cloneRat(a.High), a.HighInclusive
+		out.HighInfinite = a.HighInfinite
+	default:
+		switch c := a.High.Cmp(b.High); {
+		case c < 0:
+			out.High, out.HighInclusive = cloneRat(a.High), a.HighInclusive
+		case c > 0:
+			out.High, out.HighInclusive = cloneRat(b.High), b.HighInclusive
+		default:
+			out.High = cloneRat(a.High)
+			out.HighInclusive = a.HighInclusive && b.HighInclusive
+		}
+	}
+
+	if !out.LowInfinite && !out.HighInfinite {
+		switch c := out.Low.Cmp(out.High); {
+		case c > 0:
+			return Interval{}, false
+		case c == 0 && (!out.LowInclusive || !out.HighInclusive):
+			return Interval{}, false
+		}
+	}
+	return out, true
+}
+
+// IntervalContainsBias reports whether b belongs to a shifted bias
+// interval. It is a direct endpoint comparison and does not apply the
+// signed-zero special rule (that rule is already burned into iv).
+func IntervalContainsBias(iv Interval, b *big.Rat) bool {
+	if !iv.LowInfinite {
+		switch c := b.Cmp(iv.Low); {
+		case c < 0:
+			return false
+		case c == 0 && !iv.LowInclusive:
+			return false
+		}
+	}
+	if !iv.HighInfinite {
+		switch c := b.Cmp(iv.High); {
+		case c > 0:
+			return false
+		case c == 0 && !iv.HighInclusive:
+			return false
+		}
+	}
+	return true
+}
+
+// MinimumBias chooses a bias of least absolute value in a nonempty
+// interval. It returns the chosen signed bias and true when such a bias is
+// attained. If zero lies inside the interval, zero is selected.
+//
+// If the least absolute value is an infimum at an excluded endpoint, it
+// returns that endpoint's signed value with attainable=false.
+func MinimumBias(iv Interval) (*big.Rat, bool) {
+	if iv.LowInfinite && iv.HighInfinite {
+		return new(big.Rat), true
+	}
+	if iv.LowInfinite {
+		if iv.High.Sign() > 0 {
+			return new(big.Rat), true
+		}
+		return cloneRat(iv.High), iv.HighInclusive
+	}
+	if iv.HighInfinite {
+		if iv.Low.Sign() < 0 {
+			return new(big.Rat), true
+		}
+		return cloneRat(iv.Low), iv.LowInclusive
+	}
+
+	switch {
+	case iv.Low.Sign() <= 0 && iv.High.Sign() >= 0:
+		zeroInside := (iv.Low.Sign() < 0 || iv.LowInclusive) &&
+			(iv.High.Sign() > 0 || iv.HighInclusive)
+		return new(big.Rat), zeroInside
+	case iv.High.Sign() < 0:
+		return cloneRat(iv.High), iv.HighInclusive
+	default:
+		return cloneRat(iv.Low), iv.LowInclusive
+	}
+}
+
+// AddBias performs exact rational addition and then rounds to binary16.
+// The negative-zero convention used by calibration is explicit: negative
+// zero is retained only for a literal negative zero plus exact zero bias;
+// all other exact cancellations become positive zero.
+func AddBias(originalNegative bool, original, bias *big.Rat) Bits {
+	sum := new(big.Rat).Add(original, bias)
+	sumNegative := originalNegative && original.Sign() == 0 && bias.Sign() == 0
+	return Convert(sumNegative, sum)
 }

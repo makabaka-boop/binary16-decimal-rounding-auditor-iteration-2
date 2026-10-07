@@ -18,6 +18,9 @@
 // every successful entry additionally carries the exact reduced
 // rational interval of input values that encode to that bit pattern,
 // including endpoint inclusion under roundTiesToEven.
+//
+// A same-length "targets" array switches the request to exact common
+// additive-bias calibration instead of per-item conversion.
 package main
 
 import (
